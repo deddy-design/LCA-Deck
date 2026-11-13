@@ -1173,7 +1173,7 @@ class Component extends DCLogic {
     const el = this.sc; if (!el) return;
     const n = this.secs.filter(Boolean).length || Math.round(el.scrollHeight / this.H);
     idx = Math.max(0, Math.min(n - 1, idx));
-    this.targetIdx = idx;
+    this.targetIdx = idx; this.springing = false;
     this.scrollDir = idx * this.H > el.scrollTop ? 1 : -1;
     this.snapTo(el, idx * this.H);
   }
@@ -1184,42 +1184,75 @@ class Component extends DCLogic {
   setupPaging() {
     const el = document.querySelector('.deck-scroller'); if (!el) return;
     this.sc = el;
-    let acc = 0, prevD = 0, dir = 0, idleT = null;
-    const ahead = () => (this.snapping && this.targetIdx != null ? this.targetIdx * this.H - el.scrollTop : 0);
+    // Content follows the wheel / finger 1:1. Past 20% of a slide it glides on to the next one;
+    // let go before that and it springs back to the slide it came from.
+    const COMMIT = 0.2;
+    const sc = () => window.__S || 1;                       // screen px -> deck px
+    let base = 0, prevD = 0, run = 0, swallow = false, idleT = null, springT = null;
+    const restIdx = () => Math.round(el.scrollTop / this.H);
+    const maxIdx = () => (this.secs.filter(Boolean).length || Math.round(el.scrollHeight / this.H)) - 1;
+    const commit = (sgn) => { swallow = true; clearTimeout(springT); this.goTo(base + sgn); base = this.targetIdx; };
+    const drag = (dy) => {                                  // move by dy deck px, keep within one slide of base
+      const lo = Math.max(0, base - 1) * this.H, hi = Math.min(maxIdx(), base + 1) * this.H;
+      el.scrollTop = Math.max(lo, Math.min(hi, el.scrollTop + dy));
+      return el.scrollTop - base * this.H;
+    };
     el.addEventListener('wheel', (e) => {
-      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;          // sideways: leave to the testimonial row
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;            // sideways: leave to the testimonial row
       e.preventDefault();
+      this.lastWheel = performance.now();
       const d = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaMode === 2 ? e.deltaY * this.H : e.deltaY;
       if (!d) return;
-      const sgn = d > 0 ? 1 : -1;
       clearTimeout(idleT);
-      idleT = setTimeout(() => { acc = 0; prevD = 0; dir = 0; }, 220);   // the gesture has ended
-      const newGesture = dir === 0;
-      // a real push (not the fading tail of trackpad momentum): steady or growing, or a wheel notch
-      const fresh = newGesture || (Math.abs(d) >= 4 && (Math.abs(d) >= Math.abs(prevD) * 0.95 || Math.abs(d) >= 50));
+      idleT = setTimeout(() => { swallow = false; prevD = 0; run = 0; }, 220);   // gesture over
+      // after a glide, ignore the fading tail of trackpad momentum until the user pushes again
+      // a new push = speeding up again, a wheel notch, a change of direction, or a steady stream (momentum only ever fades)
+      run = Math.abs(d) >= 8 && Math.abs(d) >= Math.abs(prevD) * 0.98 ? run + 1 : 0;
+      const pushing = prevD * d < 0 || Math.abs(d) >= 50 || (Math.abs(d) >= 4 && Math.abs(d) > Math.abs(prevD) * 1.15) || run >= 6;
       prevD = d;
-      if (sgn !== dir) { acc = 0; dir = sgn; }
-      if (!fresh) return;
-      const rem = ahead();
-      const reversing = this.snapping && rem * sgn < 0;
-      // while gliding the same way, line up the next slide once the current one is about half way in
-      if (this.snapping && !reversing && Math.abs(rem) > this.H * 0.65) { acc = 0; return; }
-      acc += Math.abs(d);
-      if (acc >= (newGesture || reversing ? 10 : 50)) { acc = 0; this.goTo(this.pageBase() + sgn); }
+      if (swallow) { if (!pushing) return; swallow = false; }
+      if (this.snapping && this.springing) this.cancelSnap();   // springing back: the new push takes over
+      if (this.snapping) {
+        // still gliding: a push the other way turns it around, otherwise wait for it to land
+        if ((this.targetIdx * this.H - el.scrollTop) * d < 0) commit(d > 0 ? 1 : -1);
+        return;
+      }
+      if (Math.abs(el.scrollTop - base * this.H) < 0.5 || Math.abs(el.scrollTop - restIdx() * this.H) < 0.5) base = restIdx();
+      const off = drag(d / sc());
+      if (Math.abs(off) >= this.H * COMMIT) { commit(off > 0 ? 1 : -1); return; }
+      clearTimeout(springT);
+      springT = setTimeout(() => { if (!this.snapping) { this.springing = true; this.snapTo(el, base * this.H); } }, 160);   // not far enough: back
     }, { passive: false });
-    let ty = null, tx = null;
-    el.addEventListener('touchstart', (e) => { const t = e.touches[0]; ty = t.clientY; tx = t.clientX; }, { passive: true });
+    let ty = null, tx = null, lastY = 0, lastT = 0, vy = 0, axis = null;
+    el.addEventListener('touchstart', (e) => {
+      const t = e.touches[0]; ty = lastY = t.clientY; tx = t.clientX; lastT = performance.now(); vy = 0; axis = null;
+      clearTimeout(springT);
+      this.touching = true;
+      if (this.snapping) this.cancelSnap();
+      base = restIdx();
+    }, { passive: true });
     el.addEventListener('touchmove', (e) => {
       if (ty == null) return;
       const t = e.touches[0];
-      if (Math.abs(t.clientY - ty) > Math.abs(t.clientX - tx)) e.preventDefault();
+      if (!axis) { if (Math.abs(t.clientY - ty) < 6 && Math.abs(t.clientX - tx) < 6) return; axis = Math.abs(t.clientY - ty) > Math.abs(t.clientX - tx) ? 'y' : 'x'; }
+      if (axis !== 'y') return;
+      e.preventDefault();
+      const now = performance.now(), dy = lastY - t.clientY;
+      vy = 0.7 * (dy / Math.max(1, now - lastT)) + 0.3 * vy;   // px per ms, + = towards next
+      lastY = t.clientY; lastT = now;
+      drag(dy / sc());
     }, { passive: false });
-    el.addEventListener('touchend', (e) => {
+    const touchEnd = () => {
       if (ty == null) return;
-      const t = e.changedTouches[0], dy = ty - t.clientY, dx = tx - t.clientX;
-      ty = null;
-      if (Math.abs(dy) >= 30 && Math.abs(dy) > Math.abs(dx)) this.goTo(this.pageBase() + (dy > 0 ? 1 : -1));
-    }, { passive: true });
+      ty = null; this.touching = false;
+      if (axis !== 'y') return;
+      const off = el.scrollTop - base * this.H;
+      const flick = Math.abs(vy) > 0.5 && Math.abs(off) > 24 && vy * off > 0;
+      if (Math.abs(off) >= this.H * COMMIT || flick) this.goTo(base + (off > 0 ? 1 : -1));
+      else { this.springing = true; this.snapTo(el, base * this.H); }
+    };
+    el.addEventListener('touchend', touchEnd, { passive: true });
+    el.addEventListener('touchcancel', touchEnd, { passive: true });
     window.addEventListener('keydown', (e) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const tag = (e.target && e.target.tagName) || '';
@@ -1552,7 +1585,7 @@ class Component extends DCLogic {
           if (top !== prev) this.scrollDir = top > prev ? 1 : -1;
           this.lastTop = top;
           clearTimeout(this.settleTimer);
-          this.settleTimer = setTimeout(() => this.settle(el), 130);
+          this.settleTimer = setTimeout(() => { if (performance.now() - (this.lastWheel || 0) > 300 && !this.snapping && !this.touching) this.settle(el); }, 130);
         }
         if (this.scrollRaf) return;
         this.scrollRaf = requestAnimationFrame(() => {
