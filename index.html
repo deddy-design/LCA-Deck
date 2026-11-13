@@ -1141,19 +1141,29 @@ class Component extends DCLogic {
     this.snapTo(el, Math.max(0, Math.min(idx * H, max)));
   }
   snapTo(el, target) {
+    const t0 = performance.now();
+    const v0 = this.anim ? this.anim.vel(t0) : 0;            // px per second of the glide in progress
     this.cancelSnap();
     const from = el.scrollTop, dist = target - from;
     if (Math.abs(dist) < 1) { el.scrollTop = target; this.lastTop = el.scrollTop; this.setRest(true); return; }
-    const dur = Math.min(620, 320 + Math.abs(dist) * 0.35);
-    const ease = (t) => 1 - Math.pow(1 - t, 4);
-    const t0 = performance.now();
+    const carry = v0 * dist > 0;                               // already moving this way: continue smoothly
+    const D = (carry ? 560 : 760) + Math.max(0, Math.abs(dist) - this.H) * 0.2;   // ms
+    const Ds = D / 1000;
+    // smooth start -> fast middle -> smooth end
+    const cubic = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(2 - 2 * t, 3) / 2);
+    const cubicV = (t) => (t < 0.5 ? 12 * t * t : 3 * Math.pow(2 - 2 * t, 2));
+    // cubic Hermite: starts at the current speed, ends at rest
+    const herm = (t) => dist * (3 * t * t - 2 * t * t * t) + v0 * Ds * (t * t * t - 2 * t * t + t);
+    const hermV = (t) => (dist * (6 * t - 6 * t * t) + v0 * Ds * (3 * t * t - 4 * t + 1)) / Ds;
+    const pos = (t) => from + (carry ? herm(t) : dist * cubic(t));
+    this.anim = { vel: (now) => { const t = Math.min(1, (now - t0) / D); return t >= 1 ? 0 : (carry ? hermV(t) : dist * cubicV(t) / Ds); } };
     this.snapping = true;
     this.setRest(false);
     const step = (now) => {
-      const t = Math.min(1, (now - t0) / dur);
-      el.scrollTop = from + dist * ease(t);
+      const t = Math.min(1, (now - t0) / D);
+      el.scrollTop = pos(t);
       if (t < 1) this.snapRaf = requestAnimationFrame(step);
-      else { this.snapRaf = null; this.snapping = false; this.lastTop = el.scrollTop; this.setRest(true); }
+      else { this.snapRaf = null; this.anim = null; this.snapping = false; this.lastTop = el.scrollTop; this.setRest(true); }
     };
     this.snapRaf = requestAnimationFrame(step);
   }
@@ -1174,15 +1184,28 @@ class Component extends DCLogic {
   setupPaging() {
     const el = document.querySelector('.deck-scroller'); if (!el) return;
     this.sc = el;
-    let acc = 0, locked = false, idleT = null;
+    let acc = 0, prevD = 0, dir = 0, idleT = null;
+    const ahead = () => (this.snapping && this.targetIdx != null ? this.targetIdx * this.H - el.scrollTop : 0);
     el.addEventListener('wheel', (e) => {
       if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;          // sideways: leave to the testimonial row
       e.preventDefault();
+      const d = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaMode === 2 ? e.deltaY * this.H : e.deltaY;
+      if (!d) return;
+      const sgn = d > 0 ? 1 : -1;
       clearTimeout(idleT);
-      idleT = setTimeout(() => { locked = false; acc = 0; }, 180); // gesture (and its momentum) has ended
-      if (locked) return;
-      acc += e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
-      if (Math.abs(acc) >= 10) { locked = true; const d = acc > 0 ? 1 : -1; acc = 0; this.goTo(this.pageBase() + d); }
+      idleT = setTimeout(() => { acc = 0; prevD = 0; dir = 0; }, 220);   // the gesture has ended
+      const newGesture = dir === 0;
+      // a real push (not the fading tail of trackpad momentum): steady or growing, or a wheel notch
+      const fresh = newGesture || (Math.abs(d) >= 4 && (Math.abs(d) >= Math.abs(prevD) * 0.95 || Math.abs(d) >= 50));
+      prevD = d;
+      if (sgn !== dir) { acc = 0; dir = sgn; }
+      if (!fresh) return;
+      const rem = ahead();
+      const reversing = this.snapping && rem * sgn < 0;
+      // while gliding the same way, line up the next slide once the current one is about half way in
+      if (this.snapping && !reversing && Math.abs(rem) > this.H * 0.55) { acc = 0; return; }
+      acc += Math.abs(d);
+      if (acc >= (newGesture || reversing ? 10 : 50)) { acc = 0; this.goTo(this.pageBase() + sgn); }
     }, { passive: false });
     let ty = null, tx = null;
     el.addEventListener('touchstart', (e) => { const t = e.touches[0]; ty = t.clientY; tx = t.clientX; }, { passive: true });
@@ -1208,13 +1231,14 @@ class Component extends DCLogic {
       else if (e.key === 'End') { e.preventDefault(); this.goTo(99); return; }
       if (!d) return;
       e.preventDefault();
-      if (!e.repeat || !this.snapping) this.goTo(this.pageBase() + d);
+      if (e.repeat && this.snapping && Math.abs(this.targetIdx * this.H - this.sc.scrollTop) > this.H * 0.55) return;
+      this.goTo(this.pageBase() + d);
     });
   }
   cancelSnap() {
     clearTimeout(this.settleTimer);
     if (this.snapRaf) cancelAnimationFrame(this.snapRaf);
-    this.snapRaf = null; this.snapping = false;
+    this.snapRaf = null; this.snapping = false; this.anim = null;
   }
   componentWillUnmount() {
     this.cancelSnap(); clearTimeout(this.revealTimer); this.stopTyping(); if (this.scrollRaf) cancelAnimationFrame(this.scrollRaf); if (this.mraf) cancelAnimationFrame(this.mraf); }
